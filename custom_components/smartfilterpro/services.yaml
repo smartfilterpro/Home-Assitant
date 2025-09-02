@@ -1,1 +1,19 @@
-
+order_filter:
+  name: Order Filter
+  description: Place a filter order for a device
+  fields:
+    device_id:
+      required: true
+      example: "abc123"
+force_sync:
+  name: Force Sync
+  description: Fetch latest data now
+set_goal:
+  name: Set Goal
+  description: Update target runtime/IAQ goal
+  fields:
+    device_id:
+      required: true
+    goal_hours:
+      required: true
+      example: 300
