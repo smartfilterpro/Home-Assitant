@@ -1,1 +1,17 @@
-
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to SmartFilterPro",
+        "description": "Enter your API token from SmartFilterPro.",
+        "data": {
+          "token": "API Token",
+          "api_base": "API Base URL"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not connect. Check token or server."
+    }
+  }
+}
