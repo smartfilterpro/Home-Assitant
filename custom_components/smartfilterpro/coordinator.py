@@ -23,7 +23,7 @@ class SmartFilterProCoordinator(DataUpdateCoordinator):
         # Poll fallback (if webhook not firing), fetch current state
         try:
             headers = {"Authorization": f"Bearer {self.token}"}
-            async with self.session.get(f"{self.api_base}/devices", headers=headers) as r:
+            async with self.session.get(f"{self.api_base}", headers=headers) as r:
                 r.raise_for_status()
                 data = await r.json()
                 self._state = data  # normalize to {device_id: {...}}
