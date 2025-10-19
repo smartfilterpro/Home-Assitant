@@ -1,185 +1,300 @@
+# custom_components/smartfilterpro/config_flow.py
 from __future__ import annotations
 
 import json
 import logging
+from typing import Any, Dict, Iterable, Optional
+
 import aiohttp
 import voluptuous as vol
 from homeassistant import config_entries
-from homeassistant.core import callback
-from homeassistant.helpers import entity_registry as er
+from homeassistant.core import callback, HomeAssistant
+from homeassistant.data_entry_flow import FlowResult
+from homeassistant.helpers.selector import selector  # for label/value dropdown
 
 from .const import (
     DOMAIN,
-    # IDs / entity
-    CONF_USER_ID,
-    CONF_HVAC_ID,
-    CONF_ENTITY_ID,
-    # workflow paths
-    CONF_API_BASE,
-    CONF_POST_PATH,
-    CONF_RESOLVER_PATH,
-    CONF_RESET_PATH,
-    # resolved data-api URL
-    CONF_DATA_OBJ_URL,
+    # ids
+    CONF_USER_ID, CONF_HVAC_ID, CONF_HVAC_UID, CONF_CLIMATE_ENTITY_ID,
+    # creds & endpoints
+    CONF_EMAIL, CONF_PASSWORD,
+    CONF_API_BASE, CONF_LOGIN_PATH, CONF_POST_PATH, CONF_RESOLVER_PATH,
+    CONF_RESET_PATH, CONF_STATUS_URL, CONF_REFRESH_PATH,
+    # tokens
+    CONF_ACCESS_TOKEN, CONF_REFRESH_TOKEN, CONF_EXPIRES_AT,
     # defaults
-    DEFAULT_API_BASE,
-    DEFAULT_POST_PATH,
-    DEFAULT_RESOLVER_PATH,
-    DEFAULT_RESET_PATH,
+    DEFAULT_API_BASE, DEFAULT_LOGIN_PATH, DEFAULT_POST_PATH, DEFAULT_RESOLVER_PATH,
+    DEFAULT_RESET_PATH, DEFAULT_STATUS_URL, DEFAULT_REFRESH_PATH,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
+# Bubble login keys (some are aliases we accept)
+LOGIN_KEY_MAP = {
+    "access_token": ("access_token", "token", "id_token"),
+    "refresh_token": ("refresh_token", "rtoken"),
+    "expires_at": ("expires_at",),
+    "expires_in": ("expires_in",),
+    "user_id": ("user_id", "uid"),
+    "hvac_id": ("hvac_id", "primary_hvac_id"),   # may be str or list
+    "hvac_ids": ("hvac_ids",),                   # optional list of ids
+    "hvac_name": ("hvac_name",),                 # list aligned with hvac_id(s)
+}
 
-def _climate_entities(hass) -> dict[str, str]:
-    """Return dict: climate entity_id -> pretty label."""
-    out: dict[str, str] = {}
-    ent_reg = er.async_get(hass)
-    for eid in hass.states.async_entity_ids("climate"):
-        st = hass.states.get(eid)
-        ent = ent_reg.async_get(eid)
-        nice = (ent and ent.original_name) or (st and st.name) or eid
-        out[eid] = f"{nice} ({eid})"
-    return out
+CHOICE_SKIP = "__SFP_SKIP__"  # sentinel for “skip climate selection”
+
+
+def _pick(obj: Dict[str, Any], *keys):
+    for k in keys:
+        if k in obj and obj[k] is not None:
+            return obj[k]
+    return None
+
+
+def _normalize_hvac(val: Any) -> Optional[str]:
+    """Ensure HVAC id is a simple string (handles list or stringified list)."""
+    if val is None:
+        return None
+    if isinstance(val, (list, tuple, set)):
+        for item in val:
+            return str(item)
+        return None
+    s = str(val).strip()
+    if s.startswith("[") and s.endswith("]"):
+        try:
+            js = s.replace("'", '"') if ("'" in s and '"' not in s) else s
+            arr = json.loads(js)
+            if isinstance(arr, Iterable):
+                for item in arr:
+                    return str(item)
+        except Exception:
+            s = s.strip("[]").strip().strip("'").strip('"')
+            return s or None
+    return s or None
+
+
+def _climate_entity_ids(hass: HomeAssistant) -> list[str]:
+    try:
+        return sorted(list(hass.states.async_entity_ids("climate")))
+    except Exception:
+        return []
+
+
+STEP_LOGIN_SCHEMA = vol.Schema({
+    vol.Required(CONF_EMAIL): str,
+    vol.Required(CONF_PASSWORD): str,
+    vol.Optional(CONF_API_BASE, default=DEFAULT_API_BASE): str,
+    vol.Optional(CONF_LOGIN_PATH, default=DEFAULT_LOGIN_PATH): str,
+    vol.Optional(CONF_POST_PATH, default=DEFAULT_POST_PATH): str,
+    vol.Optional(CONF_RESOLVER_PATH, default=DEFAULT_RESOLVER_PATH): str,
+    vol.Optional(CONF_RESET_PATH, default=DEFAULT_RESET_PATH): str,
+    vol.Optional(CONF_REFRESH_PATH, default=DEFAULT_REFRESH_PATH): str,
+    vol.Optional(CONF_STATUS_URL, default=DEFAULT_STATUS_URL): str,  # can override absolute status URL
+})
 
 
 class SmartFilterProConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """
-    Two-step flow:
-      1) Account & Link: enter USER_ID/HVAC_ID (and optional workflow paths);
-         resolve hidden Bubble object id via resolver workflow.
-      2) Choose Thermostat: pick HA climate entity to forward to Bubble.
-    """
+    """Config flow for SmartFilterPro."""
     VERSION = 1
-    _step1: dict | None = None  # temp store between steps
 
-    async def async_step_user(self, user_input=None):
-        """Step 1: capture IDs and resolve Bubble object ID."""
-        errors: dict[str, str] = {}
+    def __init__(self) -> None:
+        self._login_ctx: Dict[str, Any] = {}
+        self._hvac_options: list[dict] = []         # [{"label": "...", "value": "..."}]
+        self._hvac_name_by_id: Dict[str, str] = {}  # {"id": "friendly name"}
+        self._pending_entry_data: Dict[str, Any] = {}
 
-        # sticky defaults so fields don't clear on error
-        defaults = {
-            CONF_USER_ID: "",
-            CONF_HVAC_ID: "",
-            CONF_API_BASE: DEFAULT_API_BASE,
-            CONF_POST_PATH: DEFAULT_POST_PATH,
-            CONF_RESOLVER_PATH: DEFAULT_RESOLVER_PATH,
-            CONF_RESET_PATH: DEFAULT_RESET_PATH,
+    # ------------- Step 1: Login -------------
+    async def async_step_user(self, user_input: Optional[Dict[str, Any]] = None) -> FlowResult:
+        errors: Dict[str, str] = {}
+
+        if user_input is None:
+            return self.async_show_form(step_id="user", data_schema=STEP_LOGIN_SCHEMA, errors=errors)
+
+        email = user_input[CONF_EMAIL].strip()
+        password = user_input[CONF_PASSWORD]
+
+        api_base = user_input.get(CONF_API_BASE, DEFAULT_API_BASE).rstrip("/")
+        login_path = user_input.get(CONF_LOGIN_PATH, DEFAULT_LOGIN_PATH).strip("/")
+        post_path = user_input.get(CONF_POST_PATH, DEFAULT_POST_PATH).strip("/")
+        resolver_path = user_input.get(CONF_RESOLVER_PATH, DEFAULT_RESOLVER_PATH).strip("/")
+        reset_path = user_input.get(CONF_RESET_PATH, DEFAULT_RESET_PATH).strip("/")
+        refresh_path = user_input.get(CONF_REFRESH_PATH, DEFAULT_REFRESH_PATH).strip("/")
+        override_status_url = user_input.get(CONF_STATUS_URL)
+
+        login_url = f"{api_base}/{login_path}"
+
+        # Login
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.post(login_url, json={"email": email, "password": password}, timeout=25) as resp:
+                    txt = await resp.text()
+                    if resp.status >= 400:
+                        _LOGGER.error("Login %s -> %s %s", login_url, resp.status, txt[:500])
+                        errors["base"] = "Cannot connect"
+                        return self.async_show_form(step_id="user", data_schema=STEP_LOGIN_SCHEMA, errors=errors)
+                    try:
+                        data = json.loads(txt)
+                    except Exception:
+                        _LOGGER.error("Login non-JSON: %s", txt[:500])
+                        errors["base"] = "unknown"
+                        return self.async_show_form(step_id="user", data_schema=STEP_LOGIN_SCHEMA, errors=errors)
+        except Exception as e:
+            _LOGGER.exception("Login call failed: %s", e)
+            errors["base"] = "cannot_connect"
+            return self.async_show_form(step_id="user", data_schema=STEP_LOGIN_SCHEMA, errors=errors)
+
+        body = data.get("response", data) if isinstance(data, dict) else {}
+
+        access_token  = _pick(body, *LOGIN_KEY_MAP["access_token"])
+        refresh_token = _pick(body, *LOGIN_KEY_MAP["refresh_token"])
+        expires_at    = _pick(body, *LOGIN_KEY_MAP["expires_at"])
+        expires_in    = _pick(body, *LOGIN_KEY_MAP["expires_in"])
+        user_id       = _pick(body, *LOGIN_KEY_MAP["user_id"])
+
+        raw_hvac_id   = _pick(body, *LOGIN_KEY_MAP["hvac_id"])  # may be str or list
+        hvac_ids_alt  = _pick(body, *LOGIN_KEY_MAP["hvac_ids"]) or []
+        hvac_names    = _pick(body, *LOGIN_KEY_MAP["hvac_name"]) or []
+
+        if not access_token or not user_id:
+            _LOGGER.error("Login response missing access_token/user_id: %s", body)
+            errors["base"] = "unknown"
+            return self.async_show_form(step_id="user", data_schema=STEP_LOGIN_SCHEMA, errors=errors)
+
+        # Convert expires_in to expires_at if needed
+        if expires_at is None and isinstance(expires_in, (int, float)):
+            import time as _t
+            expires_at = int(_t.time()) + int(expires_in)
+
+        # Normalize thermostats
+        ids: list[str] = []
+        if isinstance(raw_hvac_id, list):
+            ids.extend(str(x) for x in raw_hvac_id if x)
+        elif isinstance(raw_hvac_id, (str, int)):
+            ids.append(str(raw_hvac_id))
+        ids.extend(str(x) for x in hvac_ids_alt if x)
+        # unique (preserve order)
+        seen = set()
+        ids = [x for x in ids if not (x in seen or seen.add(x))]
+
+        # Map id -> name from aligned list (if present)
+        self._hvac_name_by_id = {}
+        for idx, _id in enumerate(ids):
+            nm = hvac_names[idx] if idx < len(hvac_names) else None
+            name = (str(nm).strip() if isinstance(nm, (str, int)) else None) or str(_id)
+            self._hvac_name_by_id[str(_id)] = name
+
+        # Build dropdown options
+        self._hvac_options = [{"label": f"{self._hvac_name_by_id[i]} ({i})", "value": i} for i in ids]
+
+        # Stash login context
+        self._login_ctx = {
+            CONF_EMAIL: email,
+            CONF_API_BASE: api_base,
+            CONF_LOGIN_PATH: login_path,
+            CONF_POST_PATH: post_path,
+            CONF_RESOLVER_PATH: resolver_path,
+            CONF_RESET_PATH: reset_path,
+            CONF_REFRESH_PATH: refresh_path,
+            CONF_STATUS_URL: (override_status_url.strip() if override_status_url else None),
+            CONF_ACCESS_TOKEN: access_token,
+            CONF_REFRESH_TOKEN: refresh_token,
+            CONF_EXPIRES_AT: expires_at,
+            CONF_USER_ID: user_id,
         }
-        if user_input:
-            defaults.update(user_input)
 
-        if user_input is not None:
-            user_id = (user_input.get(CONF_USER_ID) or "").strip()
-            hvac_id = (user_input.get(CONF_HVAC_ID) or "").strip()
-            api_base = (user_input.get(CONF_API_BASE) or DEFAULT_API_BASE).rstrip("/")
-            post_path = (user_input.get(CONF_POST_PATH) or DEFAULT_POST_PATH).strip("/")
-            resolver_path = (user_input.get(CONF_RESOLVER_PATH) or DEFAULT_RESOLVER_PATH).strip("/")
-            reset_path = (user_input.get(CONF_RESET_PATH) or DEFAULT_RESET_PATH).strip("/")
+        # Routing
+        if not self._hvac_options:
+            _LOGGER.warning("SmartFilterPro: no thermostats found for this account; aborting setup.")
+            return self.async_abort(reason="no_thermostats_found")
 
-            if not user_id:
-                errors[CONF_USER_ID] = "required"
-            if not hvac_id:
-                errors[CONF_HVAC_ID] = "required"
+        if len(self._hvac_options) == 1:
+            only = self._hvac_options[0]["value"]
+            _LOGGER.debug("SFP: single thermostat -> %s", only)
+            return await self._resolve_and_prepare(only)
 
-            if not errors:
-                url = f"{api_base}/{resolver_path}"
-                try:
-                    async with aiohttp.ClientSession() as s:
-                        r = await s.post(url, json={"user_id": user_id, "hvac_id": hvac_id}, timeout=20)
-                        txt = await r.text()
+        return await self.async_step_hvac()
 
-                        if r.status >= 400:
-                            _LOGGER.error("Resolver %s -> %s %s", url, r.status, txt[:500])
-                            errors["base"] = "cannot_connect"
-                        else:
-                            # Be lenient about Bubble wrappers: {status, response:{obj_id}}
-                            try:
-                                data = json.loads(txt)
-                            except Exception:
-                                _LOGGER.error("Resolver returned non-JSON: %s", txt[:500])
-                                errors["base"] = "cannot_connect"
-                            else:
-                                resp = data.get("response", {}) if isinstance(data, dict) else {}
-                                obj_id = (data.get("obj_id") if isinstance(data, dict) else None) or resp.get("obj_id")
+    # ------------- Step 2: Choose Bubble thermostat -------------
+    async def async_step_hvac(self, user_input: Optional[Dict[str, Any]] = None) -> FlowResult:
+        if user_input is None:
+            schema = vol.Schema({
+                vol.Required(CONF_HVAC_ID): selector({
+                    "select": {
+                        "options": self._hvac_options,
+                        "mode": "dropdown"
+                    }
+                })
+            })
+            return self.async_show_form(step_id="hvac", data_schema=schema, errors={})
 
-                                if not obj_id:
-                                    _LOGGER.error("Resolver JSON missing obj_id. Body: %s", txt[:500])
-                                    errors["base"] = "not_found"
-                                else:
-                                    # Build the exact Data API URL your sensors will poll
-                                    data_obj_url = (
-                                        f"https://smartfilterpro.com/version-test/api/1.1/obj/thermostats/{obj_id}"
-                                    )
-                                    # Stash everything for step 2
-                                    self._step1 = {
-                                        CONF_USER_ID: user_id,
-                                        CONF_HVAC_ID: hvac_id,
-                                        CONF_API_BASE: api_base,
-                                        CONF_POST_PATH: post_path,
-                                        CONF_RESOLVER_PATH: resolver_path,
-                                        CONF_RESET_PATH: reset_path,
-                                        CONF_DATA_OBJ_URL: data_obj_url,
-                                    }
-                                    return await self.async_step_select_entity()
+        hvac_id = str(user_input[CONF_HVAC_ID])
+        return await self._resolve_and_prepare(hvac_id)
 
-                except Exception as e:
-                    _LOGGER.exception("Resolver call failed: %s", e)
-                    errors["base"] = "cannot_connect"
+    # ------------- Prepare entry; then optional HA climate selection -------------
+    async def _resolve_and_prepare(self, hvac_id: Optional[str]) -> FlowResult:
+        api_base = self._login_ctx[CONF_API_BASE]
+        resolver_path = self._login_ctx[CONF_RESOLVER_PATH]
+        user_id = self._login_ctx[CONF_USER_ID]
 
-        schema = vol.Schema({
-            vol.Required(CONF_USER_ID, default=defaults[CONF_USER_ID]): str,
-            vol.Required(CONF_HVAC_ID, default=defaults[CONF_HVAC_ID]): str,
-            vol.Optional(CONF_API_BASE, default=defaults[CONF_API_BASE]): str,
-            vol.Optional(CONF_POST_PATH, default=defaults[CONF_POST_PATH]): str,
-            vol.Optional(CONF_RESOLVER_PATH, default=defaults[CONF_RESOLVER_PATH]): str,
-            vol.Optional(CONF_RESET_PATH, default=defaults[CONF_RESET_PATH]): str,
-        })
-        return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
+        # Optional resolver (non-fatal)
+        try:
+            if hvac_id:
+                resolver_url = f"{api_base}/{resolver_path}"
+                async with aiohttp.ClientSession() as s:
+                    async with s.post(resolver_url, json={"user_id": user_id, "hvac_id": hvac_id}, timeout=20) as r:
+                        _ = await r.text()
+        except Exception as e:
+            _LOGGER.debug("Resolver skipped/failed: %s", e)
 
-    async def async_step_select_entity(self, user_input=None):
-        """Step 2: choose which climate.* to forward."""
-        if not self._step1:
-            return await self.async_step_user()
+        status_url = self._login_ctx.get(CONF_STATUS_URL) or f"{api_base.rstrip('/')}/{DEFAULT_STATUS_URL.strip('/')}"
+        bubble_name = self._hvac_name_by_id.get(str(hvac_id)) if hvac_id else None
 
-        errors: dict[str, str] = {}
-        entities = _climate_entities(self.hass)
-        if not entities:
-            errors["base"] = "no_climate"
+        self._pending_entry_data = {
+            CONF_USER_ID: user_id,
+            CONF_HVAC_ID: hvac_id,
+            CONF_HVAC_UID: hvac_id,
+            "hvac_name": bubble_name,                   # <-- keep Bubble-friendly name
+            CONF_API_BASE: api_base,
+            CONF_POST_PATH: self._login_ctx[CONF_POST_PATH],
+            CONF_RESOLVER_PATH: resolver_path,
+            CONF_RESET_PATH: self._login_ctx[CONF_RESET_PATH],
+            CONF_STATUS_URL: status_url,
+            CONF_REFRESH_PATH: self._login_ctx[CONF_REFRESH_PATH],
+            CONF_ACCESS_TOKEN: self._login_ctx.get(CONF_ACCESS_TOKEN),
+            CONF_REFRESH_TOKEN: self._login_ctx.get(CONF_REFRESH_TOKEN),
+            CONF_EXPIRES_AT: self._login_ctx.get(CONF_EXPIRES_AT),
+        }
+        return await self.async_step_climate()
 
-        default_entity = next(iter(entities), "")
-
-        if user_input is not None and not errors:
-            entity_id = user_input[CONF_ENTITY_ID]
-            data = dict(self._step1)
-            data[CONF_ENTITY_ID] = entity_id
-            return self.async_create_entry(title="SmartFilterPro", data=data)
-
-        schema = vol.Schema({
-            vol.Required(CONF_ENTITY_ID, default=default_entity): vol.In(entities) if entities else str
-        })
-        return self.async_show_form(step_id="select_entity", data_schema=schema, errors=errors)
-
-    @staticmethod
+    # ------------- Step 3: Optional HA climate entity (with Skip) -------------
     @callback
-    def async_get_options_flow(config_entry):
-        return SmartFilterProOptionsFlow(config_entry)
+    async def async_step_climate(self, user_input: Optional[Dict[str, Any]] = None) -> FlowResult:
+        try:
+            ha_climates = sorted(list(self.hass.states.async_entity_ids("climate")))
+        except Exception:
+            ha_climates = []
 
+        # Always include an explicit Skip option so Submit is enabled
+        choices_dict = {CHOICE_SKIP: "Skip (no thermostat)"}
+        for eid in ha_climates:
+            choices_dict[eid] = eid
 
-class SmartFilterProOptionsFlow(config_entries.OptionsFlow):
-    """Allow changing which climate entity is bound to this entry."""
-    def __init__(self, entry: config_entries.ConfigEntry):
-        self.entry = entry
+        if user_input is None:
+            schema = vol.Schema({
+                vol.Required(CONF_CLIMATE_ENTITY_ID, default=CHOICE_SKIP): vol.In(choices_dict)
+            })
+            return self.async_show_form(step_id="climate", data_schema=schema, errors={})
 
-    async def async_step_init(self, user_input=None):
-        entities = _climate_entities(self.hass)
-        schema = vol.Schema({
-            vol.Required(CONF_ENTITY_ID, default=self.entry.data.get(CONF_ENTITY_ID)):
-                vol.In(entities) if entities else str
-        })
-        if user_input is not None:
-            new = dict(self.entry.data)
-            new[CONF_ENTITY_ID] = user_input[CONF_ENTITY_ID]
-            self.hass.config_entries.async_update_entry(self.entry, data=new)
-            return self.async_create_entry(title="", data={})
-        return self.async_show_form(step_id="init", data_schema=schema)
+        selection = user_input.get(CONF_CLIMATE_ENTITY_ID)
+        data = dict(self._pending_entry_data)
+
+        if selection and selection != CHOICE_SKIP:
+            data[CONF_CLIMATE_ENTITY_ID] = selection
+            st = self.hass.states.get(selection)
+            friendly = st.name if st and getattr(st, "name", None) else selection
+            title = f"SmartFilterPro — {friendly}"
+        else:
+            hv_name = data.get("hvac_name")
+            title = f"SmartFilterPro — {hv_name}" if hv_name else "SmartFilterPro"
+
+        return self.async_create_entry(title=title, data=data)
